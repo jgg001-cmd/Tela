@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sala de Assistir</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script src="https://www.youtube.com/iframe_api"></script>
+<style>
+[hidden]{display:none!important}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:#0b0d12;color:#eee}
+header{padding:12px 16px;background:#141821;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+h1{font-size:18px;margin:0}
+#status{color:#9aa3b5;font-size:14px}
+main{padding:16px;display:grid;gap:12px;max-width:1000px;margin:0 auto}
+.card{background:#141821;border-radius:12px;padding:14px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input,select,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #2a3142;background:#0b0d12;color:#eee}
+input{flex:1;min-width:160px}
+button{background:#5865f2;border:none;font-weight:600;cursor:pointer}
+button.sec{background:#2a3142}
+button:disabled{opacity:.4;cursor:default}
+#vid{width:100%;aspect-ratio:16/9;background:#000;border-radius:10px;display:block}
+#ytWrap iframe{width:100%;aspect-ratio:16/9;height:auto;border:0;border-radius:10px;display:block}
+</style>
+</head>
+<body>
+<header><h1>Sala de Assistir</h1><span id="status">Desconectado</span></header>
+<main>
+  <section class="card" id="home">
+    <div class="row">
+      <button id="createBtn">Criar sala</button>
+      <input id="codeIn" placeholder="Código da sala">
+      <button id="joinBtn" class="sec">Entrar</button>
+    </div>
+  </section>
+
+  <section class="card" id="hostPanel" hidden>
+    <div class="row">Código: <b id="roomCode"></b> <button class="sec" id="copyBtn">Copiar link</button></div>
+    <div class="row" style="margin-top:10px">
+      <select id="modeSel">
+        <option value="yt">YouTube</option>
+        <option value="file">Arquivo</option>
+        <option value="screen">Tela (PC)</option>
+      </select>
+    </div>
+    <div class="row" id="ytBox" style="margin-top:10px">
+      <input id="ytUrl" placeholder="Cole o link do YouTube">
+      <button id="ytLoad">Carregar</button>
+    </div>
+    <div class="row" id="fileBox" style="margin-top:10px" hidden>
+      <input type="file" id="fileIn" accept="video/*">
+    </div>
+    <div class="row" id="screenBox" style="margin-top:10px" hidden>
+      <button id="screenBtn">Começar a compartilhar</button>
+    </div>
+  </section>
+
+  <section class="card" id="tools" hidden>
+    <button id="micBtn" class="sec" disabled>Microfone: desligado</button>
+  </section>
+
+  <section class="card">
+    <div id="ytWrap" hidden><div id="ytPlayer"></div></div>
+    <video id="vid" playsinline controls></video>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let peer = null, isHost = false, hostId = '', roomCode = '';
+let myMic = null, mixCtx = null, mixDest = null, fileSrc = null;
+let outStream = null, conns = [], hostConn = null, currentCall = null;
+let mode = 'yt', curYtId = null, screenStream = null;
+let ytPlayer = null, ytReady = false, pendingYt = null;
+
+window.onYouTubeIframeAPIReady = () => {
+  ytReady = true;
+  if (pendingYt) { const p = pendingYt; pendingYt = null; loadYt(p.id, p.time, p.playing); }
+};
+
+const setStatus = t => { $('status').textContent = t; };
+const ytIdFrom = u => { const m = u.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([\w-]{11})/); return m ? m[1] : null; };
+const silentTrack = () => new AudioContext().createMediaStreamDestination().stream.getAudioTracks()[0];
+
+async function getMic() {
+  let t;
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    t = s.getAudioTracks()[0];
+  } catch (e) { t = silentTrack(); }
+  t.enabled = false;
+  return t;
+}
+
+$('micBtn').onclick = () => {
+  if (!myMic) return;
+  myMic.enabled = !myMic.enabled;
+  $('micBtn').textContent = 'Microfone: ' + (myMic.enabled ? 'ligado' : 'desligado');
+};
+
+function applyMode() {
+  $('ytWrap').hidden = mode !== 'yt';
+  $('vid').hidden = mode === 'yt';
+  if (mode !== 'yt' && ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo();
+}
+
+/* ---------- YouTube ---------- */
+function loadYt(id, time, playing) {
+  if (!ytReady) { pendingYt = { id, time, playing }; return; }
+  if (!ytPlayer) {
+    ytPlayer = new YT.Player('ytPlayer', {
+      videoId: id,
+      playerVars: { playsinline: 1, start: Math.floor(time) },
+      events: {
+        onReady: () => { if (playing) ytPlayer.playVideo(); },
+        onStateChange: () => { if (isHost) sendSync(); }
+      }
+    });
+  } else {
+    ytPlayer.loadVideoById({ videoId: id, startSeconds: time });
+  }
+}
+
+function syncMsg() {
+  return { type: 'sync', t: ytPlayer.getCurrentTime(), p: ytPlayer.getPlayerState() === 1, ts: Date.now() };
+}
+function sendSync() { if (ytPlayer && ytPlayer.getCurrentTime) broadcast(syncMsg()); }
+setInterval(() => { if (isHost && mode === 'yt') sendSync(); }, 2000);
+
+function applySync(m) {
+  if (!ytPlayer || !ytPlayer.getPlayerState || mode !== 'yt') return;
+  const target = m.t + (m.p ? (Date.now() - m.ts) / 1000 : 0);
+  if (Math.abs(ytPlayer.getCurrentTime() - target) > 1.5) ytPlayer.seekTo(target, true);
+  const st = ytPlayer.getPlayerState();
+  if (m.p && st !== 1 && st !== 3) ytPlayer.playVideo();
+  if (!m.p && st === 1) ytPlayer.pauseVideo();
+}
+
+/* ---------- Host: áudio e saída ---------- */
+function initMix() {
+  mixCtx = new (window.AudioContext || window.webkitAudioContext)();
+  mixDest = mixCtx.createMediaStreamDestination();
+}
+function buildOut(vt) {
+  outStream = new MediaStream([...(vt ? [vt] : []), ...mixDest.stream.getAudioTracks()]);
+}
+function broadcast(m) { conns.forEach(c => { if (c.open) c.send(m); }); }
+function sendState(conn) {
+  conn.send({ type: 'mode', mode, ytId: curYtId });
+  if (mode === 'yt' && ytPlayer && ytPlayer.getCurrentTime) conn.send(syncMsg());
+}
+function setMode(m, ytId) {
+  mode = m; curYtId = ytId || null; applyMode();
+  broadcast({ type: 'mode', mode: m, ytId: curYtId });
+  broadcast({ type: 'reload' });
+}
+function stopLocal() {
+  const v = $('vid');
+  v.pause(); v.removeAttribute('src'); v.srcObject = null;
+  if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
+  if (fileSrc) { fileSrc.disconnect(); fileSrc = null; }
+}
+function publishSource(s, m) {
+  if (fileSrc) { fileSrc.disconnect(); fileSrc = null; }
+  const at = s.getAudioTracks();
+  if (at.length) { fileSrc = mixCtx.createMediaStreamSource(new MediaStream(at)); fileSrc.connect(mixDest); }
+  buildOut(s.getVideoTracks()[0] || null);
+  setMode(m, null);
+}
+function attachPeer(id, s) {
+  const at = s.getAudioTracks();
+  if (!at.length) return;
+  mixCtx.createMediaStreamSource(new MediaStream(at)).connect(mixDest);
+}
+
+async function createRoom() {
+  isHost = true;
+  roomCode = Math.random().toString(36).slice(2, 8);
+  hostId = 'sala-' + roomCode;
+  initMix();
+  myMic = await getMic();
+  mixCtx.createMediaStreamSource(new MediaStream([myMic])).connect(mixDest);
+  buildOut(null);
+  peer = new Peer(hostId);
+  peer.on('open', () => {
+    $('roomCode').textContent = roomCode;
+    $('home').hidden = true;
+    $('hostPanel').hidden = false;
+    $('tools').hidden = false;
+    $('micBtn').disabled = false;
+    setStatus('Você é o host');
+  });
+  peer.on('connection', conn => {
+    conns.push(conn);
+    conn.on('open', () => sendState(conn));
+    conn.on('close', () => { conns = conns.filter(x => x !== conn); });
+  });
+  peer.on('call', call => {
+    call.answer(outStream);
+    call.on('stream', s => attachPeer(call.peer, s));
+  });
+  peer.on('error', e => setStatus('Erro: ' + e.type));
+}
+
+function hostYt(id) {
+  stopLocal();
+  buildOut(null);
+  setMode('yt', id);
+  loadYt(id, 0, false);
+}
+
+/* ---------- Viewer ---------- */
+function connectMedia() {
+  if (currentCall) currentCall.close();
+  currentCall = peer.call(hostId, new MediaStream([myMic]));
+  currentCall.on('stream', s => { $('vid').srcObject = s; $('vid').play().catch(() => {}); });
+}
+
+function handleMsg(m) {
+  if (m.type === 'reload') return connectMedia();
+  if (m.type === 'mode') {
+    mode = m.mode; applyMode();
+    if (m.mode === 'yt' && m.ytId) loadYt(m.ytId, 0, false);
+  }
+  if (m.type === 'sync') applySync(m);
+}
+
+async function joinRoom(c) {
+  if (!c) return;
+  isHost = false;
+  hostId = 'sala-' + c;
+  myMic = await getMic();
+  peer = new Peer();
+  peer.on('open', () => {
+    hostConn = peer.connect(hostId, { reliable: true });
+    hostConn.on('data', handleMsg);
+    hostConn.on('open', () => setStatus('Conectado'));
+    hostConn.on('close', () => setStatus('O host saiu'));
+    connectMedia();
+    $('home').hidden = true;
+    $('tools').hidden = false;
+    $('micBtn').disabled = false;
+    setStatus('Conectando...');
+  });
+  peer.on('error', e => setStatus('Erro: ' + e.type));
+}
+
+/* ---------- Controles do host ---------- */
+$('createBtn').onclick = createRoom;
+$('joinBtn').onclick = () => joinRoom($('codeIn').value.trim());
+$('copyBtn').onclick = () => {
+  navigator.clipboard.writeText(location.href.split('#')[0] + '#' + roomCode);
+  alert('Link copiado');
+};
+$('modeSel').onchange = () => {
+  const m = $('modeSel').value;
+  $('ytBox').hidden = m !== 'yt';
+  $('fileBox').hidden = m !== 'file';
+  $('screenBox').hidden = m !== 'screen';
+};
+$('ytLoad').onclick = () => {
+  const id = ytIdFrom($('ytUrl').value.trim());
+  if (!id) return alert('Link do YouTube inválido');
+  hostYt(id);
+};
+$('fileIn').onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  stopLocal();
+  const v = $('vid');
+  v.src = URL.createObjectURL(f);
+  v.onloadedmetadata = () => {
+    const s = v.captureStream ? v.captureStream() : v.mozCaptureStream();
+    publishSource(s, 'file');
+    v.play().catch(() => {});
+  };
+};
+$('screenBtn').onclick = async () => {
+  try {
+    stopLocal();
+    screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+      audio: true
+    });
+    const v = $('vid');
+    v.srcObject = screenStream; v.muted = true; v.play().catch(() => {});
+    publishSource(screenStream, 'screen');
+    screenStream.getVideoTracks()[0].onended = () => setStatus('Compartilhamento parado');
+  } catch (e) { alert('Não foi possível compartilhar: ' + e.message); }
+};
+
+if (location.hash) $('codeIn').value = location.hash.slice(1);
+applyMode();
+</script>
+</body>
+</html>
